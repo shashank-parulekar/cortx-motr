@@ -7868,6 +7868,122 @@ static void ut_basic_tree_oper_icp(void)
 	btree_ut_fini();
 }
 
+/**
+ *  This routine will recursively go through the tree branches and find if any
+ *  btree violation is present. The current violation checks are:
+ *  1) Every Key in the leaf nodes should be less than the next Key in the same
+ *     leaf node.
+ *  2) The first Key in the leaf node is less than or equal to the Key in the
+ *     previous record present in the parent (or grandparent or higher
+ *     ancestor).
+ *  3) The last Key in the leaf/internal node is always less than the Key in
+ *     the next record present in the parent (or grandparent or higher
+ *     ancestor).
+ */
+static bool btree_ut_validate_tree(struct nd        *node,
+				   struct m0_bufvec *prev_key,
+				   struct m0_bufvec *last_key)
+{
+	struct slot              slot_1;
+	struct slot              slot_2;
+	struct m0_bufvec_cursor  cur_1;
+	struct m0_bufvec_cursor  cur_2;
+	struct m0_bufvec_cursor *this_key_cursor;
+	struct m0_bufvec_cursor *next_key_cursor;
+	int                      diff;
+	int                      i;
+
+	M0_ASSERT(node_count_rec(node)> 0);
+
+	slot_1.s_node = slot_2.s_node = node;
+	slot_1.s_idx = 0;
+	node_key(&slot_1);
+	this_key_cursor = &cur_1;
+	m0_bufvec_cursor_init(&this_key_cursor,
+			      &slot_1.s_rec.r_key.k_data);
+
+	if (prev_key != NULL) {
+		/** Prev key <= this key>*/
+		struct m0_bufvec_cursor *prev_key_cursor = &cur_2;
+
+		m0_bufvec_cursor_init(prev_key_cursor, prev_key);
+		diff = m0_bufvec_cursor_cmp(prev_key_cursor,
+					    this_key_cursor);
+		M0_ASSERT(diff < 0);
+	}
+
+	if (node_level(node) > 0) { /** Internal node */
+		struct seg_addr          child_addr;
+		struct node_op           op;
+		struct m0_bufvec         last_key_in_subtree;
+		struct m0_bufvec_cursor *last_key_cursor;
+
+		last_key_cursor = &cur_2;
+		for (i = 0; i < node_count_rec(node); i++) {
+			slot_1.s_idx = i;
+			node_child(&slot_1, &child_addr);
+			M0_ASSERT(address_in_segment(child_addr));
+
+			node_key(&slot_1);
+			m0_bufvec_cursor_init(this_key_cursor,
+					      &slot_1.s_rec.r_key.k_data);
+
+			node_get(&op, node->n_tree, &child_addr, 0);
+			M0_ASSERT(op.no_op.o_sm.sm_rc == 0);
+
+			btree_ut_validate_tree(op.no_node, prev_key,
+					       &last_key_in_subtree);
+
+			node_put(&op, op.no_node, NULL);
+
+			if (i == (node_count_rec(node) - 1)) {
+				*last_slot = last_slot_in_subtree;
+				break;
+			}
+
+			m0_bufvec_cursor_init(last_key_cursor,
+					      &last_key_in_subtree);
+
+			diff = m0_bufvec_cursor_cmp(last_key_cursor,
+						    this_key_cursor);
+			M0_ASSERT(diff < 0);
+
+			*prev_key = &slot_1.s_rec.r_key.k_data;
+		}
+	} else { /** Leaf node */
+		struct slot             *next_slot;
+
+		next_slot = &slot_2;
+		next_key_cursor = &cur_2;
+
+		for (i = 1; i < node_count(node); i++) {
+			next_slot->s_idx = i;
+			node_key(next_slot);
+			m0_bufvec_cursor_init(next_key_cursor,
+					      &next_slot->s_rec.r_key.k_data);
+
+			diff = m0_bufvec_cursor_cmp(this_key_cursor,
+						    next_key_cursor);
+			M0_ASSERT(diff < 0);
+
+			this_key_cursor = next_key_cursor;
+			if (next_slot == &slot_1) {
+				next_slot = &slot_2;
+				next_key_cursor = &cur_2;
+			} else {
+				next_slot = &slot_1;
+				next_key_cursor = &cur_1;
+			}
+		}
+
+		if (last_key)
+			*last_key = (node_count(node) == 1 ||
+				     next_slot == &slot_2) ?
+					slot_1.s_rec.r_key.k_data :
+					slot_2.s_rec.r_key.k_data;
+	}
+}
+
 struct cb_data {
 	/** Key that needs to be stored or retrieved. */
 	struct m0_btree_key *key;
@@ -9530,6 +9646,31 @@ static void btree_ut_kv_oper_thread_handler(struct btree_ut_thread_info *ti)
 	m0_be_ut_backend_thread_exit(ut_be);
 }
 
+struct btree_ut_monitor_tinfo {
+	struct m0_thread   ti_q;   /** Used for thread operations. */
+	struct m0_btree  **ti;     /** Start of ti array. */
+	uint32_t           ti_cnt; /** Count of trees to monitor. */
+};
+
+static void btree_ut_monitor_thread_handler(struct btree_ut_monitor_tinfo *mi)
+{
+	uint32_t i;
+
+	while (!thread_start)
+		;
+
+	/** Run till the main thread tells us to stop. */
+	while (m0_nanosleep(m0_time(2, 0), NULL) == 0 && thread_start) {
+		/** For every tree run the sanity test. */
+		for (i = 0; i < mi->ti_cnt; i++) {
+			m0_rwlock_write_lock(mi->ti[i]->t_desc);
+			btree_ut_validate_tree(mi->ti[i]->t_desc);
+			m0_rwlock_write_unlock(mi->ti[i]->t_desc);
+		}
+
+	}
+}
+
 /**
  * This function allocates an array pointed by cpuid_ptr and fills it with the
  * CPU ID of the CPUs which are currently online.
@@ -9623,6 +9764,7 @@ static void btree_ut_kv_oper(int32_t thread_count, int32_t tree_count,
 	time_t                        curr_time;
 	uint32_t                      rnode_sz        = 1024;
 	uint32_t                      rnode_sz_shift;
+	struct btree_ut_monitor_tinfo mon_ti = {};
 
 	M0_ENTRY();
 
@@ -9755,6 +9897,18 @@ static void btree_ut_kv_oper(int32_t thread_count, int32_t tree_count,
 		M0_ASSERT(rc == 0);
 	}
 
+	/**
+	 *  Add a btree sanity monitor thread which will check the sanity of
+	 *  the btree at regular intervals
+	 */
+	mon_ti.ti     = ut_trees;
+	mon_ti.ti_cnt = tree_count;
+	rc = M0_THREAD_INIT(&mon_ti.ti_q, struct btree_ut_monitor_tinfo *,
+			    NULL,
+			    &btree_ut_monitor_thread_handler, &mon_ti,
+			    "Thread-%d", thread_count);
+	M0_ASSERT(rc == 0);
+
 	/** Initialized all the threads by now. Let's get rolling ... */
 	UT_START_THREADS();
 
@@ -9762,6 +9916,7 @@ static void btree_ut_kv_oper(int32_t thread_count, int32_t tree_count,
 		m0_thread_join(&ti[i].ti_q);
 		m0_thread_fini(&ti[i].ti_q);
 	}
+	m0_thread_join(&mon_ti.ti_q);
 
 	cred = M0_BE_TX_CB_CREDIT(0, 0, 0);
 	m0_be_allocator_credit(NULL, M0_BAO_FREE_ALIGNED, rnode_sz,
