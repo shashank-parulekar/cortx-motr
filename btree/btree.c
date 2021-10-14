@@ -1320,20 +1320,6 @@ static void bnode_capture(struct slot *slot, struct m0_be_tx *tx);
 static void bnode_lock(struct nd *node);
 static void bnode_unlock(struct nd *node);
 static void bnode_fini(const struct nd *node);
-/**
- * Common node header.
- *
- * This structure is located at the beginning of every node, right after
- * m0_format_header. It is used by the segment operations (node_op) to identify
- * node and tree types.
- */
-struct node_header {
-	uint32_t      h_node_type;
-	uint32_t      h_tree_type;
-	uint64_t      h_gen;
-	struct m0_fid h_fid;
-	uint64_t      h_opaque;
-};
 
 /**
  * This structure will store information required at particular level
@@ -2439,31 +2425,6 @@ static void bnode_op_fini(struct node_op *op)
  *  --------------------------------------------
  */
 
-/**
- *  Structure of the node in persistent store.
- */
-struct ff_head {
-	struct m0_format_header  ff_fmt;    /*< Node Header */
-	struct node_header       ff_seg;    /*< Node type information */
-
-	/**
-	 * The above 2 structures should always be together with node_header
-	 * following the m0_format_header.
-	 */
-
-	uint16_t                 ff_used;   /*< Count of records */
-	uint8_t                  ff_shift;  /*< Node size as pow-of-2 */
-	uint8_t                  ff_level;  /*< Level in Btree */
-	uint16_t                 ff_ksize;  /*< Size of key in bytes */
-	uint16_t                 ff_vsize;  /*< Size of value in bytes */
-	struct m0_format_footer  ff_foot;   /*< Node Footer */
-	void                    *ff_opaque; /*< opaque data */
-	/**
-	 *  This space is used to host the Keys and Values upto the size of the
-	 *  node
-	 */
-} M0_XCA_RECORD M0_XCA_DOMAIN(be);
-
 static void ff_init(const struct segaddr *addr, int shift, int ksize, int vsize,
 		    uint32_t ntype, uint64_t gen, struct m0_fid fid);
 static void ff_fini(const struct nd *node);
@@ -3289,26 +3250,6 @@ static void ff_rec_del_credit(const struct nd *node, m0_bcount_t ksize,
  *	storage and calculation.
  *	Cons: Any metadata corruption will result in undefined behavior.
  */
-struct fkvv_head {
-	struct m0_format_header  fkvv_fmt;    /*< Node Header */
-	struct node_header       fkvv_seg;    /*< Node type information */
-
-	/**
-	 * The above 2 structures should always be together with node_header
-	 * following the m0_format_header.
-	 */
-
-	uint16_t                 fkvv_used;   /*< Count of records */
-	uint8_t                  fkvv_shift;  /*< Node size as pow-of-2 */
-	uint8_t                  fkvv_level;  /*< Level in Btree */
-	uint16_t                 fkvv_ksize;  /*< Size of key in bytes */
-	struct m0_format_footer  fkvv_foot;   /*< Node Footer */
-	void                    *fkvv_opaque; /*< opaque data */
-	/**
-	 *  This space is used to host the Keys and Values upto the size of the
-	 *  node
-	 */
-} M0_XCA_RECORD M0_XCA_DOMAIN(be);
 
 #define OFFSET_SIZE sizeof(uint32_t)
 
@@ -4292,31 +4233,6 @@ static const struct node_type variable_kv_format = {
 	/* .nt_ksize_get          = ff_ksize_get, */
 	/* .nt_valsize_get        = ff_valsize_get, */
 };
-
-struct dir_rec {
-	uint32_t key_offset;
-	uint32_t val_offset;
-};
-struct vkvv_head {
-	struct m0_format_header  vkvv_fmt;        /*< Node Header */
-	struct node_header       vkvv_seg;        /*< Node type information */
-	/**
-	 * The above 2 structures should always be together with node_header
-	 * following the m0_format_header.
-	 */
-
-	uint16_t                 vkvv_used;       /*< Count of records */
-	uint8_t                  vkvv_shift;      /*< Node size as pow-of-2 */
-	uint8_t                  vkvv_level;      /*< Level in Btree */
-	uint32_t                 vkvv_dir_offset; /*< Offset pointing to dir */
-
-	struct m0_format_footer  vkvv_foot;       /*< Node Footer */
-	void                    *vkvv_opaque;     /*< opaque data */
-	/**
-	 *  This space is used to host the Keys, Values and Directory upto the
-	 *  size of the node.
-	 */
-} M0_XCA_RECORD M0_XCA_DOMAIN(be);
 
 static struct vkvv_head *vkvv_data(const struct nd *node)
 {

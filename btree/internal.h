@@ -24,8 +24,11 @@
 #ifndef __MOTR_BTREE_INTERNAL_H__
 #define __MOTR_BTREE_INTERNAL_H__
 
-#include "sm/op.h"
 #include "be/op.h"   /* m0_be_op */
+#include "format/format.h" /* struct m0_format_header */
+#include "format/format_xc.h" /* struct m0_format_header */
+#include "fid/fid.h"
+#include "fid/fid_xc.h"
 
 /**
  * @defgroup btree
@@ -33,25 +36,7 @@
  * @{
  */
 
-enum m0_btree_opcode;
 struct m0_btree_oimpl;
-
-struct m0_btree_op {
-	struct m0_sm_op             bo_op;
-	struct m0_sm_group          bo_sm_group;
-	struct m0_sm_op_exec        bo_op_exec;
-	enum m0_btree_opcode        bo_opc;
-	struct m0_btree            *bo_arbor;
-	struct m0_btree_rec         bo_rec;
-	struct m0_btree_cb          bo_cb;
-	struct m0_be_tx            *bo_tx;
-	struct m0_be_seg           *bo_seg;
-	uint64_t                    bo_flags;
-	m0_bcount_t                 bo_limit;
-	struct m0_btree_oimpl      *bo_i;
-	struct m0_btree_idata       bo_data;
-	struct m0_btree_rec_key_op  bo_keycmp;
-};
 
 enum m0_btree_node_format_version {
 	M0_BTREE_NODE_FORMAT_VERSION_1 = 1,
@@ -77,6 +62,92 @@ struct m0_btree {
 	unsigned                    t_height;
 	struct td                  *t_desc;
 };
+
+/**
+ * Common node header.
+ *
+ * This structure is located at the beginning of every node, right after
+ * m0_format_header. It is used by the segment operations (node_op) to identify
+ * node and tree types.
+ */
+struct node_header {
+	uint32_t      h_node_type;
+	uint32_t      h_tree_type;
+	uint64_t      h_gen;
+	struct m0_fid h_fid;
+	uint64_t      h_opaque;
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
+
+/**
+ *  Structure of the node in persistent store.
+ */
+struct ff_head {
+	struct m0_format_header  ff_fmt;    /*< Node Header */
+	struct node_header       ff_seg;    /*< Node type information */
+
+	/**
+	 * The above 2 structures should always be together with node_header
+	 * following the m0_format_header.
+	 */
+
+	uint16_t                 ff_used;   /*< Count of records */
+	uint8_t                  ff_shift;  /*< Node size as pow-of-2 */
+	uint8_t                  ff_level;  /*< Level in Btree */
+	uint16_t                 ff_ksize;  /*< Size of key in bytes */
+	uint16_t                 ff_vsize;  /*< Size of value in bytes */
+	struct m0_format_footer  ff_foot;   /*< Node Footer */
+	void                    *ff_opaque; /*< opaque data */
+	/**
+	 *  This space is used to host the Keys and Values upto the size of the
+	 *  node
+	 */
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
+
+struct fkvv_head {
+	struct m0_format_header  fkvv_fmt;    /*< Node Header */
+	struct node_header       fkvv_seg;    /*< Node type information */
+
+	/**
+	 * The above 2 structures should always be together with node_header
+	 * following the m0_format_header.
+	 */
+
+	uint16_t                 fkvv_used;   /*< Count of records */
+	uint8_t                  fkvv_shift;  /*< Node size as pow-of-2 */
+	uint8_t                  fkvv_level;  /*< Level in Btree */
+	uint16_t                 fkvv_ksize;  /*< Size of key in bytes */
+	struct m0_format_footer  fkvv_foot;   /*< Node Footer */
+	void                    *fkvv_opaque; /*< opaque data */
+	/**
+	 *  This space is used to host the Keys and Values upto the size of the
+	 *  node
+	 */
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
+
+struct dir_rec {
+	uint32_t key_offset;
+	uint32_t val_offset;
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
+struct vkvv_head {
+	struct m0_format_header  vkvv_fmt;        /*< Node Header */
+	struct node_header       vkvv_seg;        /*< Node type information */
+	/**
+	 * The above 2 structures should always be together with node_header
+	 * following the m0_format_header.
+	 */
+
+	uint16_t                 vkvv_used;       /*< Count of records */
+	uint8_t                  vkvv_shift;      /*< Node size as pow-of-2 */
+	uint8_t                  vkvv_level;      /*< Level in Btree */
+	uint32_t                 vkvv_dir_offset; /*< Offset pointing to dir */
+
+	struct m0_format_footer  vkvv_foot;       /*< Node Footer */
+	void                    *vkvv_opaque;     /*< opaque data */
+	/**
+	 *  This space is used to host the Keys, Values and Directory upto the
+	 *  size of the node.
+	 */
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
 
 /** @} end of btree group */
 #endif /* __MOTR_BTREE_INTERNAL_H__ */

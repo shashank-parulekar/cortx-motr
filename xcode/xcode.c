@@ -929,6 +929,14 @@ const struct m0_xcode_type M0_XT_U8 = {
 	.xct_nr     = 0
 };
 
+const struct m0_xcode_type M0_XT_U16 = {
+	.xct_aggr   = M0_XA_ATOM,
+	.xct_name   = "u16",
+	.xct_atype  = M0_XAT_U16,
+	.xct_sizeof = sizeof(uint16_t),
+	.xct_nr     = 0
+};
+
 const struct m0_xcode_type M0_XT_U32 = {
 	.xct_aggr   = M0_XA_ATOM,
 	.xct_name   = "u32",

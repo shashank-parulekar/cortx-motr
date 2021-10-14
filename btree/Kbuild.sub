@@ -1,2 +1,4 @@
 m0tr_objects += \
-                  btree/btree.o
+                  btree/btree.o        \
+                  btree/btree_xc.o     \
+                  btree/internal_xc.o

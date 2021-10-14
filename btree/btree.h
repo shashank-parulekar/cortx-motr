@@ -29,6 +29,7 @@
 #include "xcode/xcode_attr.h"
 #include "lib/errno.h"
 #include "fid/fid.h"  /** struct m0_fid */
+#include "sm/op.h"    /** struct m0_sm_op */
 
 /**
  * @defgroup btree
@@ -119,21 +120,6 @@ enum m0_btree_rec_type {
 	M0_BRT_CHILD = 2,
 };
 
-enum m0_btree_opcode {
-	M0_BO_CREATE = 1,
-	M0_BO_DESTROY,
-	M0_BO_GET,
-	M0_BO_PUT,
-	M0_BO_UPDATE,
-	M0_BO_DEL,
-	M0_BO_ITER,
-	M0_BO_MINKEY,
-	M0_BO_MAXKEY,
-	M0_BO_TRUNCATE,
-
-	M0_BO_NR
-};
-
 enum m0_btree_op_flags {
 	BOF_PREV      = M0_BITS(0),
 	BOF_NEXT      = M0_BITS(1),
@@ -157,6 +143,40 @@ enum m0_btree_status_codes {
 enum m0_btree_opflag {
 	M0_BOF_UNIQUE = 1 << 0
 };
+
+enum m0_btree_opcode {
+	M0_BO_CREATE = 1,
+	M0_BO_DESTROY,
+	M0_BO_GET,
+	M0_BO_PUT,
+	M0_BO_UPDATE,
+	M0_BO_DEL,
+	M0_BO_ITER,
+	M0_BO_MINKEY,
+	M0_BO_MAXKEY,
+	M0_BO_TRUNCATE,
+
+	M0_BO_NR
+};
+
+struct m0_btree_op {
+	struct m0_sm_op             bo_op;
+	struct m0_sm_group          bo_sm_group;
+	struct m0_sm_op_exec        bo_op_exec;
+	enum m0_btree_opcode        bo_opc;
+	struct m0_btree            *bo_arbor;
+	struct m0_btree_rec         bo_rec;
+	struct m0_btree_cb          bo_cb;
+	struct m0_be_tx            *bo_tx;
+	struct m0_be_seg           *bo_seg;
+	uint64_t                    bo_flags;
+	m0_bcount_t                 bo_limit;
+	struct m0_btree_oimpl      *bo_i;
+	struct m0_btree_idata       bo_data;
+	struct m0_btree_rec_key_op  bo_keycmp;
+};
+
+
 /**
  * Btree functions related to credit management for tree operations
  */
@@ -498,15 +518,6 @@ M0_INTERNAL void m0_btree_cursor_kv_get(struct m0_btree_cursor *it,
  * Determines if tree contains zero record.
  */
 M0_INTERNAL bool m0_btree_is_empty(struct m0_btree *btree);
-
-void m0_btree_op_init(struct m0_btree_op *bop, enum m0_btree_opcode *opc,
-		      struct m0_btree *arbor,
-		      struct m0_btree_key *key, const struct m0_btree_cb *cb,
-		      uint64_t flags, struct m0_be_tx *tx);
-void m0_btree_op_fini(struct m0_btree_op *bop);
-
-void m0_btree_op_credit(const struct m0_btree_op *bt,
-			struct m0_be_tx_credit *cr);
 
 /**
  * Calculates credits required to perform 'nr' Put KV operations. The calculated
