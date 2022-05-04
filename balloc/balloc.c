@@ -3140,6 +3140,52 @@ M0_INTERNAL void m0_balloc_init(struct m0_balloc *cb)
 	cb->cb_ballroom.ab_ops = &balloc_ops;
 }
 
+struct m0_balloc_tmp {
+	struct m0_format_header      cb_header;
+
+	/** container this block allocator belongs to. */
+	uint64_t                     cb_container_id;
+	/** the on-disk and in-memory sb */
+	struct m0_balloc_super_block cb_sb;
+
+	m0_bindex_t                  cb_last;
+
+	struct m0_ad_balloc          cb_ballroom;
+	struct m0_format_footer      cb_footer;
+
+	/*
+	 * m0_be_btree has it's own volatile-only fields, so it can't be placed
+	 * before the m0_format_footer, where only persistent fields allowed
+	 */
+	/** db for free extent */
+	struct m0_btree             cb_db_group_extents;
+	/** db for group desc */
+	struct m0_btree             cb_db_group_desc;
+
+	/*
+	 * volatile-only fields
+	 */
+
+	/** array of group info */
+	struct m0_balloc_group_info *cb_group_info;
+	/** super block lock */
+	struct m0_be_mutex           cb_sb_mutex;
+	struct m0_be_seg            *cb_be_seg;
+
+	/** Root nodes for cb_db_group_extents and cb_db_group_desc btrees. */
+	uint8_t                      cb_ge_node[BALLOC_ROOT_NODE_SIZE]
+					__AAL(BALLOC_ROOT_NODE_ALIGN);
+	uint8_t                      cb_gd_node[BALLOC_ROOT_NODE_SIZE]
+					__AAL(BALLOC_ROOT_NODE_ALIGN);
+} M0_XCA_RECORD M0_XCA_DOMAIN(be);
+
+
+volatile int total_size;
+volatile int addr_of_cb_db_group_extents;
+volatile int addr_of_cb_db_group_desc;
+volatile int addr_of_cb_ge_node;
+volatile int addr_of_cb_gd_node;
+volatile int addr_of_cb_be_seg;
 M0_INTERNAL int m0_balloc_create(uint64_t              cid,
 				 struct m0_be_seg     *seg,
 				 struct m0_sm_group   *grp,
@@ -3151,6 +3197,14 @@ M0_INTERNAL int m0_balloc_create(uint64_t              cid,
 	struct m0_be_tx_credit  cred  = {};
 	int                     rc;
 	struct m0_btree_type    bt;
+
+
+	total_size = sizeof(struct m0_balloc_tmp);
+	addr_of_cb_db_group_extents = offsetof(struct m0_balloc_tmp, cb_db_group_extents);
+	addr_of_cb_db_group_desc = offsetof(struct m0_balloc_tmp, cb_db_group_desc);
+	addr_of_cb_ge_node = offsetof(struct m0_balloc_tmp, cb_ge_node);
+	addr_of_cb_gd_node = offsetof(struct m0_balloc_tmp, cb_gd_node);
+	addr_of_cb_be_seg = offsetof(struct m0_balloc_tmp, cb_be_seg);
 
 	M0_PRE(seg != NULL);
 	M0_PRE(out != NULL);

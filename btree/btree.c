@@ -2036,7 +2036,7 @@ static int64_t bnode_get(struct node_op *op, struct td *tree,
 
 	/**
 	 * TODO: Include function bnode_access() during async mode of btree
-	 * operations to ensure that the node data is loaded form the segment.
+	 * operations to ensure that the node data is loaded from the segment.
 	 * Also consider adding a state here to return as we might need some
 	 * time to load the node if it is not loaded.
 	 */
@@ -2044,8 +2044,6 @@ static int64_t bnode_get(struct node_op *op, struct td *tree,
 	/**
 	 * TODO: Adding list_lock to protect from multiple threads
 	 * accessing the same node descriptor concurrently.
-	 * Replace it with a different global lock once hash
-	 * functionality is implemented.
 	 */
 
 	m0_rwlock_write_lock(&list_lock);
@@ -2063,6 +2061,32 @@ static int64_t bnode_get(struct node_op *op, struct td *tree,
 	nt = btree_node_format[ntype];
 
 	op->no_node = nt->nt_opaque_get(addr);
+
+	/**
+	 * We have few conditions here:
+	 * 1. Node on BE segment is mmapped in memory, and one of the following
+	 *    is TRUE::
+	 *   a. Is actively used in some other thread - 
+	 *      (op->no_node != NULL &&
+	 *       op->no_node->n_addr.as_core == addr->as_core &&
+	 *       op->no_node->n_ref > 0)
+	 *   b. Not in active use hence its node descriptor is on LRU list.
+	 *      (op->no_node != NULL &&
+	 *       op->no_node->n_addr.as_core == addr->as_core &&
+	 *       op->no_node->n_ref == 0)
+	 * 2. Node on BE segment is not mmapped in memory and needs to be loaded
+	 *    by the kernel also a new node descriptor needs to be added to
+	 *    manage this node.
+	 *    (op->no_node == NULL || 
+	 *     op->no_node->n_addr.as_core != addr->as_core)
+	 *
+	 * In case of 1a. we increment the reference counter and return to the
+	 * caller.
+	 * In case of 1b. we increment the reference counter and also detach the
+	 * node from the LRU list.
+	 * In case of 2. we allocate a new node descriptor to manage the BE node
+	 * which is loaded by the kernel for us.
+	 */
 
 	if (op->no_node != NULL &&
 	    op->no_node->n_addr.as_core == addr->as_core) {
