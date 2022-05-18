@@ -9561,6 +9561,8 @@ enum {
 };
 #endif
 
+static void validate_tree(struct td *tree);
+
 /**
  * This unit test exercises the KV operations triggered by multiple streams.
  */
@@ -9705,6 +9707,8 @@ static void ut_multi_stream_kv_oper(void)
 			m0_be_tx_fini(tx);
 		}
 	}
+
+	validate_tree(tree->t_desc);
 
 	{
 		/** Min/Max key verification test. */
@@ -9893,7 +9897,10 @@ static void ut_multi_stream_kv_oper(void)
 			m0_be_tx_close_sync(tx);
 			m0_be_tx_fini(tx);
 		}
+		validate_tree(tree->t_desc);
 	}
+
+	validate_tree(tree->t_desc);
 
 	cred = M0_BE_TX_CREDIT(0, 0);
 	m0_be_allocator_credit(NULL, M0_BAO_FREE_ALIGNED, rnode_sz,
@@ -12392,6 +12399,90 @@ static void ut_lru_test(void)
 	       mem_after_free, mem_freed);
 
 	btree_ut_fini();
+}
+
+static void traverse_and_validate(struct td *tree, struct nd *node,
+				  struct slot *prev_delimiter,
+				  struct slot *next_delimiter)
+{
+	struct node_op nop = {};
+	struct segaddr child;
+	int            rec_count;
+	int            i;
+	m0_bcount_t ksize;
+	void        *p_key1;
+	struct m0_btree_key key1 = 
+				{.k_data=M0_BUFVEC_INIT_BUF(&p_key1, &ksize)};
+	void                *p_key2;
+	struct m0_btree_key key2 =
+				{.k_data=M0_BUFVEC_INIT_BUF(&p_key2, &ksize)};
+	struct slot keyslot1 = {.s_rec.r_key = key1};
+	struct slot keyslot2 = {.s_rec.r_key = key2};
+	struct slot *curr_idx_slot;
+	struct slot *next_idx_slot;
+
+	rec_count = bnode_rec_count(node);
+	if (rec_count == 0)
+		return;
+
+	/* Read the first record. */
+	i = 0;
+	keyslot1.s_idx = i;
+	bnode_key(&keyslot1);
+
+	if (prev_delimiter) {
+		/* Make sure Key at prev_delimiter <= key at curr_idx_slot. */
+	}
+
+	if (bnode_level(node) > 0) { /* Internal Node */
+		curr_idx_slot = NULL;
+		next_idx_slot = &keyslot1;
+		while (i++ < rec_count) {
+			bnode_child(next_idx_slot, &child);
+			bnode_get(&nop, tree, &child, P_NEXTDOWN);
+			traverse_and_validate(tree, nop.no_node, curr_idx_slot,
+					      next_idx_slot);
+			curr_idx_slot = (curr_idx_slot == &keyslot1) ? &keyslot2
+								     : &keyslot1;
+			next_idx_slot = (next_idx_slot == &keyslot1) ? &keyslot2
+								     : &keyslot1;
+		}
+	} else { /* Leaf Node */
+		/**
+ 		 *  Go through all the entries in this node to make sure all the
+ 		 *  Keys are in ascending order.
+ 		 */
+		curr_idx_slot = &keyslot1;
+		next_idx_slot = &keyslot2;
+		while (i < rec_count - 1) {
+			next_idx_slot->s_idx = i + 1;
+			bnode_key(next_idx_slot);
+			/* Make sure Key1 < Key2 */
+
+			curr_idx_slot = (curr_idx_slot == &keyslot1) ? &keyslot2
+								   : &keyslot1;
+			next_idx_slot = (next_idx_slot == &keyslot1) ? &keyslot2
+								     : &keyslot1;
+		}
+	}
+
+	if (next_delimiter) {
+		/* Make sure Key at next_delimiter > key at next_idx_slot. */
+	}
+
+}
+
+static void validate_tree(struct td *tree)
+{
+	struct node_op nop = {};
+	struct nd      *root;
+
+	// First get the root node.
+	bnode_get(&nop, tree, &tree->t_root->n_addr, P_NEXTDOWN);
+	root = nop.no_node;
+
+	// Traverse the tree an validate along the way.
+	traverse_and_validate(tree, root, NULL, NULL);
 }
 
 /**
