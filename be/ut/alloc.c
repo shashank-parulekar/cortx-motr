@@ -21,6 +21,10 @@
 
 
 #define M0_TRACE_SUBSYSTEM M0_TRACE_SUBSYS_UT
+//#include <unistd.h>             /* mincore */
+#include <sys/mman.h>           /* mincore */
+#include <string.h>             /* memcmp */
+
 #include "lib/trace.h"
 
 #include "be/alloc.h"
@@ -635,6 +639,224 @@ M0_INTERNAL void m0_be_ut_alloc_align(void)
 	m0_be_ut_seg_fini(ut_seg);
 	m0_be_ut_backend_fini(ut_be);
 
+	M0_SET0(ut_be);
+}
+
+M0_INTERNAL void m0_be_ut_alloc_unmap(void)
+{
+	struct m0_be_ut_backend *ut_be  = &be_ut_alloc_backend;
+	struct m0_be_ut_seg     *ut_seg = &be_ut_alloc_seg;
+	struct m0_be_allocator  *a;
+	int                      rc;
+	int                      i = 0;
+	int                      j;
+	int                      k;
+	void                    *p = NULL;
+	struct m0_be_tx          tx;
+	struct m0_be_tx_credit   cred = {};
+	uint32_t                 test_page_count;
+	const uint32_t           page_size = m0_pagesize_get();
+	const unsigned           shift = m0_pageshift_get() - 1;
+	struct {
+		uint16_t         page_count[5];
+			}        spaces_cfg[] = {
+						{.page_count = {1, 1, 1, 1, 1}},
+						{.page_count = {2, 2, 2, 2, 2}},
+						{.page_count = {3, 3, 3, 3, 3}},
+						{.page_count = {1, 1, 2, 2, 2}},
+						{.page_count = {2, 1, 2, 1, 2}},
+						{.page_count = {2, 2, 1, 2, 2}}
+					    };
+	void                    *spaces[ARRAY_SIZE(spaces_cfg[0].page_count)];
+	uint64_t                 space_to_alloc;
+	unsigned char           *expected_page_load_map;
+	unsigned char           *actual_page_load_map;
+
+	m0_be_ut_backend_init(ut_be);
+	m0_be_ut_seg_init(ut_seg, ut_be, BE_UT_ALLOC_SEG_SIZE);
+	m0_be_ut_seg_allocator_init(ut_seg, ut_be);
+
+	a = m0_be_seg_allocator(be_ut_alloc_seg.bus_seg);
+	M0_UT_ASSERT(a != NULL);
+
+	/**
+	 * Following tests are covered:
+	 * 1)  Memory is NOT unmapped when UNMAP flag is NOT SET.
+	 * 2)  Memory is unmapped when UNMAP flag is SET. Also the unmapping
+	 *     skips the 1st CPU page which contains the chunk header.
+	 * 3)  If the previous chunk has already been freed and unmapped, then
+	 *     freeing and unmapping the current chunk will cause a merge and
+	 *     the complete chunk is unmapped (including the chunk header space
+	 *     which contained the chunk header)
+	 * 4)  If the next chunk has already been freed and unmapped (except the
+	 *     chunk header page of the next chunk) then after unmapping of the
+	 *     current chunk is done the page containing the chunk header of the
+	 *     next chunk is also unmapped.
+	 * 5)  If the previous and next chunks have been freed and unmapped and
+	 *     unmapping the current chunk will unmap the current chunk and next
+	 *     chunk completely (including the chunk header of these two
+	 *     chunks), only the chunk header of the previous chunk will remain
+	 *     mapped.
+	 * 6)  Test above scenarios with a smaller chunk which sits the chunk
+	 *     header and the allocated space within one CPU page.
+	 */
+	/**
+	 * In first test we:
+	 * 1)  Allocate 5 chunk-aligned spaces of same size from BE segmentm and
+	 *     fill them so that all the page_count are loaded in memory.
+	 * 2)  Free 3rd space with UNMAP flag NOT-SET and confirm the space is
+	 *     NOT unmapped after the free.
+	 * 3)  Allocate space of same size as before so that we get the same 3rd
+	 *     space which we had released earlier.
+	 * 4)  Free 3rd space with UNMAP flag SET and confirm the space is not
+	 *     mapped only for the freed space. The first PAGE of this space
+	 *     will still stay mapped as it contains the chunk header which the
+	 *     free routine will not unmap.
+	 * 5)  Allocate space of same size as before so that we get the same 3rd
+	 *     space which we had released above. Fill the space with random
+	 *     data so that the page_count are loaded in memory by the OS.
+	 * 6)  Free 2nd space with UNMAP flag NOT-SET and confirm this space is
+	 *     still mapped after the free.
+	 * 7)  Free 3rd space with UNMAP flag SET and confirm that only this
+	 *     space (minus 1st page containing chunk header) is unmapped. The
+	 *     2nd space should still be mapped.
+	 * 8)  Allocate 2nd space and 3rd space and fill them with data to load
+	 *     the page_count in memory.
+	 * 9)  Free 2nd space with UNMAP flag set and confirm that only this
+	 *     space (minus 1st page) is unmapped.
+	 * 10) Free 3rd space with UNMAP flag set and confirm that complete area
+	 *     of 3rd space is unmapped (including the 1st page containing the
+	 *     chunk header). Also confirm that the 2nd space is still unmapped
+	 *     the same way as in above step.
+	 * 11) Allocate 2nd and 3rd spaces and fill them with data to load the
+	 *     page_count in memory.
+	 * 12) Free 4th space with UNMAP flag set and confirm that only this
+	 *     space (minus the 1st page of this space) is unmapped.
+	 * 13) Free 3rd space with UNMAP flag set and confirm that this space
+	 *     without the 1st page of this space is unmapped. Also the 1st page
+	 *     of the 4th space should now have been unmapped.
+	 * 14) Free all the five allocated spaces.
+	 */
+
+	for (i = 0; i < ARRAY_SIZE(spaces_cfg); i++) {
+		cred = M0_BE_TX_CB_CREDIT(0, 0, 0);
+		test_page_count = 0;
+
+		for (j = 0; j < ARRAY_SIZE(spaces_cfg[i].page_count); j++)
+			test_page_count += spaces_cfg[i].page_count[j];
+
+		expected_page_load_map = m0_alloc(test_page_count);
+		actual_page_load_map = m0_alloc(test_page_count);
+
+		/**
+		 *  Account for all the credits needed while running this test
+		 *  iteration. Instead of getting accurate credit numbers we ask
+		 *  for a large number hoping we never exceed this one.
+		 */
+		for (j = 0; j < 20; j++) {
+			m0_be_allocator_credit(a, M0_BAO_ALLOC_ALIGNED,
+					       test_page_count * page_size,
+					       shift, &cred);
+
+			m0_be_allocator_credit(a, M0_BAO_FREE,
+					       test_page_count * page_size,
+					       shift, &cred);
+		}
+
+		m0_be_ut_tx_init(&tx, ut_be);
+		m0_be_tx_prep(&tx, &cred);
+		rc = m0_be_tx_open_sync(&tx);
+		M0_ASSERT(rc == 0);
+
+		/**
+		 * Allocate the spaces to use and load them in memory by
+		 * attempting to write a few bytes in every page.
+		 */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++) {
+			space_to_alloc = spaces_cfg[i].page_count[j] *
+					 page_size;
+			space_to_alloc -= sizeof(struct be_alloc_chunk);
+			M0_BE_OP_SYNC(op,
+				      m0_be_alloc_aligned(a, &tx, &op,
+							  &(spaces[j]),
+							  space_to_alloc, shift,
+							  M0_BITS(M0_BAP_NORMAL),
+							  true)
+				      );
+			M0_ASSERT(spaces[j] != NULL);
+
+			/**
+			 *  Confirm this allocated space follows the end
+			 *  address of the prev allocation
+			 */
+			M0_ASSERT(ergo(j != 0,
+				       spaces[j - 1] +
+				       spaces_cfg[i].page_count[j - 1] *
+				       page_size == spaces[j]));
+
+			p = spaces[j];
+			for (k = 0; k < spaces_cfg[i].page_count[j]; k++) {
+				*(uint64_t *)p = 0;
+				p += page_size;
+			}
+		}
+
+		/* Assume all the pages are loaded in memory */
+		for (j = 0; j < test_page_count; j++)
+			expected_page_load_map[j] = 1;
+
+		/* Verify if kernel agrees */
+		rc = mincore(spaces[0] - sizeof(struct be_alloc_chunk),
+			     test_page_count * page_size, actual_page_load_map);
+		M0_ASSERT(rc == 0);
+
+		M0_ASSERT(memcmp(actual_page_load_map, expected_page_load_map,
+				 test_page_count) == 0);
+
+
+
+		/* Release all the allocated resource for this test iteration */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++) {
+			M0_BE_OP_SYNC(op, m0_be_free_aligned(a, &tx, &op, spaces[j], false));
+		}
+
+		/* Assume ONLY the first page is loaded in memory */
+		expected_page_load_map[0] = 1;
+		for (j = 1; j < test_page_count; j++)
+			expected_page_load_map[j] = 0;
+
+		/** TBD - Remove the next block before checkin */
+		{
+			void *addr = spaces[0] - sizeof(struct be_alloc_chunk) +
+				     page_size;
+			uint64_t size = (test_page_count - 1) * page_size;
+			m0_bcount_t file_offset = (m0_bcount_t)(addr - ut_seg->bus_seg->bs_addr);
+
+			munmap(addr, size);
+			rc = madvise(addr, size, MADV_NORMAL);
+			M0_ASSERT(rc == -1 && errno == ENOMEM); /** Assert BE segment unmapped*/
+
+			p = mmap(addr, size, PROT_READ | PROT_WRITE,
+				 MAP_FIXED | MAP_PRIVATE | MAP_NORESERVE,
+				 m0_stob_fd(ut_seg->bus_seg->bs_stob), file_offset);
+			rc = madvise(addr, size, MADV_NORMAL);
+			M0_ASSERT(rc == 0);
+		}
+
+		rc = mincore(spaces[0] - sizeof(struct be_alloc_chunk),
+			     test_page_count * page_size, actual_page_load_map);
+		M0_ASSERT(rc == 0);
+
+		M0_ASSERT(memcmp(actual_page_load_map, expected_page_load_map,
+				 test_page_count) == 0);
+
+		m0_be_tx_close_sync(&tx);
+		m0_be_tx_fini(&tx);
+	}
+
+	m0_be_ut_seg_allocator_fini(ut_seg, ut_be);
+	m0_be_ut_seg_fini(ut_seg);
+	m0_be_ut_backend_fini(ut_be);
 	M0_SET0(ut_be);
 }
 
