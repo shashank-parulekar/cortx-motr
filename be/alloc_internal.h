@@ -63,14 +63,14 @@ struct be_alloc_chunk {
 	uint64_t                   bac_magic_free;
 	/** size of chunk */
 	m0_bcount_t                bac_size;
+	/** Chunk header or memory alignement as pow-of-2. */
+	uint16_t                   bac_align_shift;
 	/** is chunk free? */
 	bool                       bac_free;
 	/** Allocator zone where chunk resides. */
 	uint8_t                    bac_zone M0_XCA_FENUM(m0_be_alloc_zone_type);
 	/** Is chunk header aligned? */
 	bool                       bac_chunk_align;
-	/** Chunk header or memory alignement as pow-of-2. */
-	uint16_t                   bac_align_shift;
 	/**
 	 * M0_BE_ALLOC_MAGIC1
 	 * Used to find invalid memory access before allocated chunk.

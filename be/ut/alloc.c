@@ -21,9 +21,13 @@
 
 
 #define M0_TRACE_SUBSYSTEM M0_TRACE_SUBSYS_UT
-//#include <unistd.h>             /* mincore */
-#include <sys/mman.h>           /* mincore */
+#include <stdio.h>              /* sprintf() */
 #include <string.h>             /* memcmp */
+#include <sys/types.h>          /* getpid() */
+#include <sys/stat.h>           /* open() */
+#include <unistd.h>             /* sysconf() */
+#include <fcntl.h>              /* open() */
+#include <sys/mman.h>           /* munmnap() */
 
 #include "lib/trace.h"
 
@@ -642,6 +646,153 @@ M0_INTERNAL void m0_be_ut_alloc_align(void)
 	M0_SET0(ut_be);
 }
 
+static int get_mincore(void *start,  uint64_t bytecount, unsigned char *vec)
+{
+	char     filename[100];
+	int      fd;
+	uint64_t page_offset;
+	int      page_size = sysconf(_SC_PAGESIZE);
+	int      pages_to_read;
+	uint64_t data;
+	int      offset;
+
+	/**
+	 * This function will check if the page is mapped and loaded in memory
+	 * for the address range [start, bytecount). For every page that is
+	 * mapped and loaded the function will set 1 in the corresponding byte
+	 * of the vec array. This function retrieves the page attributes from
+	 * /proc/pid/pagemap.txt file as documented in
+	 * linux-source:Documentation/vm/pagemap.txt
+	 */
+	sprintf(filename, "/proc/%d/pagemap", getpid());
+
+	bytecount = (bytecount == 0) ? 1 : bytecount;
+	page_offset = ((uint64_t)start) / page_size;
+	pages_to_read = ((bytecount - 1) / page_size) + 1;
+
+	fd = open(filename, O_RDONLY);
+
+	offset = 0;
+	while (pages_to_read) {
+		if (pread(fd, &data, sizeof(data),
+			  page_offset * sizeof(data)) != sizeof(data))
+			return EBADF;
+		vec[offset] = (data & (1ULL << 63)) ? 1 : 0;
+		offset++;
+		pages_to_read--;
+		page_offset++;
+	}
+
+	close(fd);
+
+	return 0;
+}
+
+enum {
+	SPACE_ALLOCATED = 1,
+	SPACE_FREE_BUT_LOADED = 2,
+	SPACE_FREE_AND_UNLOADED = 3,
+};
+
+#define VERIFY_SPACES(spaces, spaces_cfg, i, space_status)                     \
+({                                                                             \
+	int             j;                                                     \
+	int             k;                                                     \
+	const uint32_t  page_size = m0_pagesize_get();                         \
+	unsigned char   page_load_map[100];                                    \
+	int             rc;                                                    \
+	bool            expect_first_page_loaded = true;                       \
+									       \
+	for (j = 0; j < ARRAY_SIZE(spaces); j++) {                             \
+		M0_ASSERT(sizeof(page_load_map) >=                             \
+				  spaces_cfg[i].page_count[j]);                \
+		rc = get_mincore(spaces[j] - sizeof(struct be_alloc_chunk),    \
+				 spaces_cfg[i].page_count[j] * page_size,      \
+					 page_load_map);                       \
+		M0_ASSERT(rc == 0);                                            \
+									       \
+		if (space_status[j] == SPACE_ALLOCATED) {                      \
+			for (k = 0; k < spaces_cfg[i].page_count[j]; k++)      \
+				M0_ASSERT(page_load_map[k] == 1);              \
+			expect_first_page_loaded = true;                       \
+		} else if (space_status[j] == SPACE_FREE_BUT_LOADED) {         \
+			for (k = 0; k < spaces_cfg[i].page_count[j]; k++)      \
+				M0_ASSERT(page_load_map[k] == 1);              \
+			expect_first_page_loaded = false;                      \
+		} else {                                                       \
+			if (expect_first_page_loaded)                          \
+				M0_ASSERT(page_load_map[0] == 1);              \
+			else                                                   \
+				M0_ASSERT(page_load_map[0] == 0);              \
+			for (k = 1; k < spaces_cfg[i].page_count[j]; k++)      \
+				M0_ASSERT(page_load_map[k] == 0);              \
+			expect_first_page_loaded = false;                      \
+		}                                                              \
+	}                                                                      \
+})
+
+#define ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx)                     \
+({                                                                             \
+	int             j;                                                     \
+	int             k;                                                     \
+	const uint32_t  page_size = m0_pagesize_get();                         \
+	unsigned char   space_status[100];                                     \
+									       \
+	M0_ASSERT(ARRAY_SIZE(space_status) > ARRAY_SIZE(spaces));              \
+	for (j = 0; j < ARRAY_SIZE(spaces); j++) {                             \
+		space_to_alloc = spaces_cfg[i].page_count[j] * page_size;      \
+		space_to_alloc -= sizeof(struct be_alloc_chunk);               \
+		M0_BE_OP_SYNC(op,                                              \
+			      m0_be_alloc_aligned(a, &tx, &op, &(spaces[j]),   \
+						  space_to_alloc, shift,       \
+						  M0_BITS(M0_BAP_NORMAL), true)\
+			     );                                                \
+		M0_ASSERT(spaces[j] != NULL);                                  \
+									       \
+		/**                                                            \
+		 *  Confirm this allocated space follows the end address of the\
+		 *  prev allocation                                            \
+		 */                                                            \
+		M0_ASSERT(ergo(j != 0, spaces[j - 1] +                         \
+			       spaces_cfg[i].page_count[j - 1] * page_size ==  \
+			       spaces[j]));                                    \
+									       \
+		/* Access all the pages in this space to load them */          \
+		p = spaces[j];                                                 \
+		for (k = 0; k < spaces_cfg[i].page_count[j]; k++) {            \
+			*(uint64_t *)p = 0;                                    \
+			p += page_size;                                        \
+		}                                                              \
+		space_status[j] = SPACE_ALLOCATED;                             \
+	}                                                                      \
+									       \
+	/** Verify all pages are loaded in memory */                           \
+	VERIFY_SPACES(spaces, spaces_cfg, i, space_status);                \
+})
+
+#define RELEASE_ALL_SPACES_AND_VERIFY(spaces, i, j, unmap_flag, tx)            \
+({                                                                             \
+	int             j;                                                     \
+	unsigned char   space_status[100];                                     \
+									       \
+	M0_ASSERT(ARRAY_SIZE(space_status) > ARRAY_SIZE(spaces));              \
+	for (j = 0; j < ARRAY_SIZE(spaces); j++) {                             \
+		M0_BE_OP_SYNC(op, m0_be_free_aligned(a, &tx, &op,              \
+						     spaces[j], unmap_flag));  \
+		space_status[j] = unmap_flag ? SPACE_FREE_AND_UNLOADED :       \
+					       SPACE_FREE_BUT_LOADED;          \
+	}                                                                      \
+									       \
+	/* Verify all pages are unloaded as expected */                        \
+	VERIFY_SPACES(spaces, spaces_cfg, i, space_status);                    \
+})
+
+#define RELEASE_SPACE(spaces, i, j, unmap_flag, tx)                            \
+({                                                                             \
+	M0_BE_OP_SYNC(op, m0_be_free_aligned(a, &tx, &op,                      \
+					     spaces[j], unmap_flag));          \
+})
+
 M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 {
 	struct m0_be_ut_backend *ut_be  = &be_ut_alloc_backend;
@@ -650,11 +801,10 @@ M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 	int                      rc;
 	int                      i = 0;
 	int                      j;
-	int                      k;
+	uint32_t                 test_page_count;
 	void                    *p = NULL;
 	struct m0_be_tx          tx;
 	struct m0_be_tx_credit   cred = {};
-	uint32_t                 test_page_count;
 	const uint32_t           page_size = m0_pagesize_get();
 	const unsigned           shift = m0_pageshift_get() - 1;
 	struct {
@@ -668,9 +818,9 @@ M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 						{.page_count = {2, 2, 1, 2, 2}}
 					    };
 	void                    *spaces[ARRAY_SIZE(spaces_cfg[0].page_count)];
+	unsigned char            space_status[ARRAY_SIZE(spaces)];
 	uint64_t                 space_to_alloc;
-	unsigned char           *expected_page_load_map;
-	unsigned char           *actual_page_load_map;
+	void                    *dummy_boundary;
 
 	m0_be_ut_backend_init(ut_be);
 	m0_be_ut_seg_init(ut_seg, ut_be, BE_UT_ALLOC_SEG_SIZE);
@@ -678,6 +828,29 @@ M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 
 	a = m0_be_seg_allocator(be_ut_alloc_seg.bus_seg);
 	M0_UT_ASSERT(a != NULL);
+
+	/**
+	 *  Allocate a dummy space as a boundary marker so that the verification
+	 *  code in the UT has correct expectations about the status of the 1st
+	 *  space in the subsequent test.
+	 */
+	cred = M0_BE_TX_CB_CREDIT(0, 0, 0);
+	m0_be_allocator_credit(a, M0_BAO_ALLOC_ALIGNED,
+			       page_size, shift, &cred);
+
+	m0_be_ut_tx_init(&tx, ut_be);
+	m0_be_tx_prep(&tx, &cred);
+	rc = m0_be_tx_open_sync(&tx);
+	M0_ASSERT(rc == 0);
+
+	M0_BE_OP_SYNC(op, m0_be_alloc_aligned(a, &tx, &op, &dummy_boundary,
+					      page_size -
+					      sizeof(struct be_alloc_chunk),
+					      shift,
+					      M0_BITS(M0_BAP_NORMAL), true));
+
+	m0_be_tx_close_sync(&tx);
+	m0_be_tx_fini(&tx);
 
 	/**
 	 * Following tests are covered:
@@ -697,56 +870,19 @@ M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 	 *     chunk completely (including the chunk header of these two
 	 *     chunks), only the chunk header of the previous chunk will remain
 	 *     mapped.
-	 * 6)  Test above scenarios with a smaller chunk which sits the chunk
+	 * 6)  Test above scenarios with pervious and/or next chunks still
+	 *     mapped and unmapping of the current chunk should not cause the
+	 *     neighboring chunks to get unmapped.
+	 * 7)  Test above scenarios with a smaller chunk which sits the chunk
 	 *     header and the allocated space within one CPU page.
-	 */
-	/**
-	 * In first test we:
-	 * 1)  Allocate 5 chunk-aligned spaces of same size from BE segmentm and
-	 *     fill them so that all the page_count are loaded in memory.
-	 * 2)  Free 3rd space with UNMAP flag NOT-SET and confirm the space is
-	 *     NOT unmapped after the free.
-	 * 3)  Allocate space of same size as before so that we get the same 3rd
-	 *     space which we had released earlier.
-	 * 4)  Free 3rd space with UNMAP flag SET and confirm the space is not
-	 *     mapped only for the freed space. The first PAGE of this space
-	 *     will still stay mapped as it contains the chunk header which the
-	 *     free routine will not unmap.
-	 * 5)  Allocate space of same size as before so that we get the same 3rd
-	 *     space which we had released above. Fill the space with random
-	 *     data so that the page_count are loaded in memory by the OS.
-	 * 6)  Free 2nd space with UNMAP flag NOT-SET and confirm this space is
-	 *     still mapped after the free.
-	 * 7)  Free 3rd space with UNMAP flag SET and confirm that only this
-	 *     space (minus 1st page containing chunk header) is unmapped. The
-	 *     2nd space should still be mapped.
-	 * 8)  Allocate 2nd space and 3rd space and fill them with data to load
-	 *     the page_count in memory.
-	 * 9)  Free 2nd space with UNMAP flag set and confirm that only this
-	 *     space (minus 1st page) is unmapped.
-	 * 10) Free 3rd space with UNMAP flag set and confirm that complete area
-	 *     of 3rd space is unmapped (including the 1st page containing the
-	 *     chunk header). Also confirm that the 2nd space is still unmapped
-	 *     the same way as in above step.
-	 * 11) Allocate 2nd and 3rd spaces and fill them with data to load the
-	 *     page_count in memory.
-	 * 12) Free 4th space with UNMAP flag set and confirm that only this
-	 *     space (minus the 1st page of this space) is unmapped.
-	 * 13) Free 3rd space with UNMAP flag set and confirm that this space
-	 *     without the 1st page of this space is unmapped. Also the 1st page
-	 *     of the 4th space should now have been unmapped.
-	 * 14) Free all the five allocated spaces.
 	 */
 
 	for (i = 0; i < ARRAY_SIZE(spaces_cfg); i++) {
 		cred = M0_BE_TX_CB_CREDIT(0, 0, 0);
+
 		test_page_count = 0;
-
-		for (j = 0; j < ARRAY_SIZE(spaces_cfg[i].page_count); j++)
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
 			test_page_count += spaces_cfg[i].page_count[j];
-
-		expected_page_load_map = m0_alloc(test_page_count);
-		actual_page_load_map = m0_alloc(test_page_count);
 
 		/**
 		 *  Account for all the credits needed while running this test
@@ -769,90 +905,276 @@ M0_INTERNAL void m0_be_ut_alloc_unmap(void)
 		M0_ASSERT(rc == 0);
 
 		/**
-		 * Allocate the spaces to use and load them in memory by
-		 * attempting to write a few bytes in every page.
+		 *  Test-1: Memory is released but UNMAP flag is NOT SET
 		 */
-		for (j = 0; j < ARRAY_SIZE(spaces); j++) {
-			space_to_alloc = spaces_cfg[i].page_count[j] *
-					 page_size;
-			space_to_alloc -= sizeof(struct be_alloc_chunk);
-			M0_BE_OP_SYNC(op,
-				      m0_be_alloc_aligned(a, &tx, &op,
-							  &(spaces[j]),
-							  space_to_alloc, shift,
-							  M0_BITS(M0_BAP_NORMAL),
-							  true)
-				      );
-			M0_ASSERT(spaces[j] != NULL);
+		memset(spaces, 0, sizeof(spaces));
 
-			/**
-			 *  Confirm this allocated space follows the end
-			 *  address of the prev allocation
-			 */
-			M0_ASSERT(ergo(j != 0,
-				       spaces[j - 1] +
-				       spaces_cfg[i].page_count[j - 1] *
-				       page_size == spaces[j]));
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
 
-			p = spaces[j];
-			for (k = 0; k < spaces_cfg[i].page_count[j]; k++) {
-				*(uint64_t *)p = 0;
-				p += page_size;
+		/* Release allocated spaces without setting the UNMAP flag */
+		RELEASE_ALL_SPACES_AND_VERIFY(spaces, i, j, false, tx);
+
+		/**
+		 *  Test-2: Memory is released with UNMAP flag SET.
+		 */
+		memset(spaces, 0, sizeof(spaces));
+
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+
+		/* Release allocated spaces also setting the UNMAP flag */
+		RELEASE_ALL_SPACES_AND_VERIFY(spaces, i, j, true, tx);
+
+		/**
+		 *  Test-3a: If previous space has been released and unmapped
+		 *  then freeing and unmapping the current space causes a merge
+		 *  of both the spaces with all the pages of both the spaces
+		 *  unmapped (except for the 1st page of the previous space).
+		 */
+		memset(spaces, 0, sizeof(spaces));
+
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
+
+		/* Release 2nd space */
+		RELEASE_SPACE(spaces, i, 1, true, tx);
+		space_status[1] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 1 && j != 2)
+				RELEASE_SPACE(spaces, i, j, true, tx);
+		memset(space_status, SPACE_FREE_AND_UNLOADED,
+		       sizeof(space_status));
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/**
+		 *  Test-3b: If previous space has been released but still
+		 *  mapped then freeing and unmapping the current space causes a
+		 *  merge of both the spaces with all the pages of the current
+		 *  spaces unmapped while the pages of the previous space remain
+		 *  mapped.
+		 */
+		memset(spaces, 0, sizeof(spaces));
+
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
+
+		/* Release 2nd space */
+		RELEASE_SPACE(spaces, i, 1, false, tx);
+		space_status[1] = SPACE_FREE_BUT_LOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 1 && j != 2) {
+				RELEASE_SPACE(spaces, i, j, true, tx);
+				space_status[j] = SPACE_FREE_AND_UNLOADED;
 			}
-		}
+		//VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+{                                                                             
+	int             j;                                                     
+	int             k;                                                     
+	const uint32_t  page_size = m0_pagesize_get();                         
+	unsigned char   page_load_map[100];                                    
+	int             rc;                                                    
+	bool            expect_first_page_loaded = true;                       
+									       
+	for (j = 0; j < ARRAY_SIZE(spaces); j++) {                             
+		M0_ASSERT(sizeof(page_load_map) >=                             
+				  spaces_cfg[i].page_count[j]);                
+		rc = get_mincore(spaces[j] - sizeof(struct be_alloc_chunk),    
+				 spaces_cfg[i].page_count[j] * page_size,      
+					 page_load_map);                       
+		M0_ASSERT(rc == 0);                                            
+									       
+		if (space_status[j] == SPACE_ALLOCATED) {                      
+			for (k = 0; k < spaces_cfg[i].page_count[j]; k++)      
+				M0_ASSERT(page_load_map[k] == 1);              
+			expect_first_page_loaded = true;                       
+		} else if (space_status[j] == SPACE_FREE_BUT_LOADED) {         
+			for (k = 0; k < spaces_cfg[i].page_count[j]; k++)      
+				M0_ASSERT(page_load_map[k] == 1);              
+			expect_first_page_loaded = false;                      
+		} else {                                                       
+			if (expect_first_page_loaded)                          
+				M0_ASSERT(page_load_map[0] == 1);              
+			else                                                   
+				M0_ASSERT(page_load_map[0] == 0);              
+			for (k = 1; k < spaces_cfg[i].page_count[j]; k++)      
+				M0_ASSERT(page_load_map[k] == 0);              
+			expect_first_page_loaded = false;                      
+		}                                                              
+	}                                                                      
+}
 
-		/* Assume all the pages are loaded in memory */
-		for (j = 0; j < test_page_count; j++)
-			expected_page_load_map[j] = 1;
+		/**
+		 *  Test-4a: If next space has been released and unmapped
+		 *  then freeing and unmapping the current space causes a merge
+		 *  of both the spaces with all the pages of both the spaces
+		 *  unmapped (except for the 1st page of the current space).
+		 */
+		memset(spaces, 0, sizeof(spaces));
 
-		/* Verify if kernel agrees */
-		rc = mincore(spaces[0] - sizeof(struct be_alloc_chunk),
-			     test_page_count * page_size, actual_page_load_map);
-		M0_ASSERT(rc == 0);
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
 
-		M0_ASSERT(memcmp(actual_page_load_map, expected_page_load_map,
-				 test_page_count) == 0);
+		/* Release 4th space */
+		RELEASE_SPACE(spaces, i, 3, true, tx);
+		space_status[3] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
+		/* Release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 2 && j != 3) {
+				RELEASE_SPACE(spaces, i, j, true, tx);
+				space_status[j] = SPACE_FREE_AND_UNLOADED;
+			}
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
-		/* Release all the allocated resource for this test iteration */
-		for (j = 0; j < ARRAY_SIZE(spaces); j++) {
-			M0_BE_OP_SYNC(op, m0_be_free_aligned(a, &tx, &op, spaces[j], false));
-		}
+		/**
+		 *  Test-4b: If next space has been released but still
+		 *  mapped then freeing and unmapping the current space causes a
+		 *  merge of both the spaces with all the pages (except 1st
+		 *  page) of the current spaces unmapped while all the pages of
+		 *  the next space continue to remain mapped.
+		 */
+		memset(spaces, 0, sizeof(spaces));
 
-		/* Assume ONLY the first page is loaded in memory */
-		expected_page_load_map[0] = 1;
-		for (j = 1; j < test_page_count; j++)
-			expected_page_load_map[j] = 0;
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
 
-		/** TBD - Remove the next block before checkin */
-		{
-			void *addr = spaces[0] - sizeof(struct be_alloc_chunk) +
-				     page_size;
-			uint64_t size = (test_page_count - 1) * page_size;
-			m0_bcount_t file_offset = (m0_bcount_t)(addr - ut_seg->bus_seg->bs_addr);
+		/* Release 4th space */
+		RELEASE_SPACE(spaces, i, 3, false, tx);
+		space_status[3] = SPACE_FREE_BUT_LOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
-			munmap(addr, size);
-			rc = madvise(addr, size, MADV_NORMAL);
-			M0_ASSERT(rc == -1 && errno == ENOMEM); /** Assert BE segment unmapped*/
+		/* Release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
-			p = mmap(addr, size, PROT_READ | PROT_WRITE,
-				 MAP_FIXED | MAP_PRIVATE | MAP_NORESERVE,
-				 m0_stob_fd(ut_seg->bus_seg->bs_stob), file_offset);
-			rc = madvise(addr, size, MADV_NORMAL);
-			M0_ASSERT(rc == 0);
-		}
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 2 && j != 3) {
+				RELEASE_SPACE(spaces, i, j, true, tx);
+				space_status[j] = SPACE_FREE_AND_UNLOADED;
+			}
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
-		rc = mincore(spaces[0] - sizeof(struct be_alloc_chunk),
-			     test_page_count * page_size, actual_page_load_map);
-		M0_ASSERT(rc == 0);
+		/**
+		 *  Test-5a: If previous & next space have been released and
+		 *  unmapped then freeing and unmapping the current space causes
+		 *  a merge of the three consecutive spaces with all the pages
+		 *  of the three spaces unmapped (except for the 1st page of the
+		 *  previous space).
+		 */
+		memset(spaces, 0, sizeof(spaces));
 
-		M0_ASSERT(memcmp(actual_page_load_map, expected_page_load_map,
-				 test_page_count) == 0);
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
+
+		/* Release 2nd space */
+		RELEASE_SPACE(spaces, i, 1, true, tx);
+		space_status[1] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release 4th space */
+		RELEASE_SPACE(spaces, i, 3, true, tx);
+		space_status[3] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Now release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 2 && j != 3 && j != 4) {
+				RELEASE_SPACE(spaces, i, j, true, tx);
+				space_status[j] = SPACE_FREE_AND_UNLOADED;
+			}
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/**
+		 *  Test-5b: If previous & next space have been released but
+		 *  still mapped then freeing and unmapping the current space
+		 *  causes a merge of the three consecutive spaces with all the
+		 *  pages of the current space unmapped (except for the 1st page
+		 *  of the previous space). All the pages of the previsou and
+		 *  next space continue to stay mapped.
+		 */
+		memset(spaces, 0, sizeof(spaces));
+
+		/* Allocate the spaces to use. */
+		ALLOC_SPACES_AND_VERIFY(spaces, spaces_cfg, i, tx);
+		memset(space_status, SPACE_ALLOCATED, sizeof(space_status));
+
+		/* Release 2nd space */
+		RELEASE_SPACE(spaces, i, 1, false, tx);
+		space_status[1] = SPACE_FREE_BUT_LOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release 4th space */
+		RELEASE_SPACE(spaces, i, 3, false, tx);
+		space_status[3] = SPACE_FREE_BUT_LOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Now release 3rd space */
+		RELEASE_SPACE(spaces, i, 2, true, tx);
+		space_status[2] = SPACE_FREE_AND_UNLOADED;
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
+
+		/* Release all remaining allocated space with UNMAP flag set */
+		for (j = 0; j < ARRAY_SIZE(spaces); j++)
+			if (j != 2 && j != 3 && j != 4) {
+				RELEASE_SPACE(spaces, i, j, true, tx);
+				space_status[j] = SPACE_FREE_AND_UNLOADED;
+			}
+		VERIFY_SPACES(spaces, spaces_cfg, i, space_status);
 
 		m0_be_tx_close_sync(&tx);
 		m0_be_tx_fini(&tx);
+
 	}
+
+	/*  Release the allocated dummy space boundary marker. */
+	cred = M0_BE_TX_CB_CREDIT(0, 0, 0);
+	m0_be_allocator_credit(a, M0_BAO_FREE, page_size, shift, &cred);
+
+	m0_be_ut_tx_init(&tx, ut_be);
+	m0_be_tx_prep(&tx, &cred);
+	rc = m0_be_tx_open_sync(&tx);
+	M0_ASSERT(rc == 0);
+
+	M0_BE_OP_SYNC(op, m0_be_free_aligned(a, &tx, &op,
+					     dummy_boundary, true));
+
+	m0_be_tx_close_sync(&tx);
+	m0_be_tx_fini(&tx);
 
 	m0_be_ut_seg_allocator_fini(ut_seg, ut_be);
 	m0_be_ut_seg_fini(ut_seg);

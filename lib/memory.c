@@ -97,6 +97,12 @@ M0_INTERNAL int    m0_arch_pageshift_get(void);
 M0_INTERNAL int    m0_arch_dont_dump(void *p, size_t size);
 M0_INTERNAL int    m0_arch_memory_init (void);
 M0_INTERNAL void   m0_arch_memory_fini (void);
+M0_INTERNAL bool   m0_arch_mem_map(void *unmap_addr,
+				   m0_bcount_t unmap_bytes,
+				   int  file_descriptor,
+				   m0_bcount_t file_offset);
+M0_INTERNAL bool   m0_arch_mem_unmap(void *unmap_addr,
+				     m0_bcount_t unmap_bytes);
 
 static struct m0_atomic64 allocated;
 static struct m0_atomic64 cumulative_alloc;
@@ -265,6 +271,21 @@ M0_INTERNAL void m0_memory_fini(void)
 	       m0_atomic64_get(&cumulative_alloc),
 	       m0_atomic64_get(&cumulative_free));
 	m0_arch_memory_fini();
+}
+
+M0_INTERNAL bool m0_memory_map(void *map_addr,
+			       m0_bcount_t map_bytes,
+			       int  file_descriptor,
+			       m0_bcount_t file_offset)
+{
+	return m0_arch_mem_map(map_addr, map_bytes, file_descriptor,
+			       file_offset);
+}
+
+M0_INTERNAL bool m0_memory_unmap(void *unmap_addr,
+				 m0_bcount_t unmap_bytes)
+{
+	return m0_arch_mem_unmap(unmap_addr, unmap_bytes);
 }
 
 #undef DEV_MODE

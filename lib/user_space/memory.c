@@ -226,6 +226,21 @@ M0_INTERNAL int m0_arch_pageshift_get()
 	return ffs(getpagesize());
 }
 
+M0_INTERNAL bool m0_arch_mem_map(void *map_addr,
+				 m0_bcount_t map_bytes,
+				 int  file_descriptor,
+				 m0_bcount_t file_offset)
+{
+	return (mmap(map_addr, map_bytes, PROT_READ | PROT_WRITE,
+		     MAP_FIXED | MAP_PRIVATE | MAP_NORESERVE,
+		     file_descriptor, file_offset) != MAP_FAILED);
+}
+
+M0_INTERNAL bool m0_arch_mem_unmap(void *unmap_addr,
+				   m0_bcount_t unmap_bytes) {
+	return munmap(unmap_addr, unmap_bytes) == 0;
+}
+
 #undef M0_TRACE_SUBSYSTEM
 
 /** @} end of memory group */

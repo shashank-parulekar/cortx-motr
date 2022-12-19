@@ -179,6 +179,26 @@ M0_INTERNAL int m0_dont_dump(void *p, size_t size);
  * Wrapper function over memmove.
  */
 M0_INTERNAL void m0_memmove(void *tgt, void *src, size_t size);
+
+/**
+ * Maps file (pointed by file_descriptor) from offset file_offset' in process
+ * memory at address map_addr for map_bytes.
+ *
+ * Mapping the file does not load the file contents in physical memory pages,
+ * for that the caller needs to access the bytes within the pages
+ */
+M0_INTERNAL bool m0_memory_map(void *map_addr,
+			       m0_bcount_t map_bytes,
+			       int  file_descriptor,
+			       m0_bcount_t file_offset);
+
+/**
+ * Unmaps the memory at address unmap_addr for the next unmap_bytes from the
+ * process space.
+ */
+M0_INTERNAL bool m0_memory_unmap(void *unmap_addr,
+				 m0_bcount_t unmap_bytes);
+
 /** @} end of memory group */
 #endif /* __MOTR_LIB_MEMORY_H__ */
 

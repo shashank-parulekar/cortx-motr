@@ -1136,37 +1136,32 @@ M0_INTERNAL size_t m0_be_chunk_header_size(void)
 	return sizeof(struct be_alloc_chunk);
 }
 
-static bool unmap_memory(struct m0_be_allocator *a, struct be_alloc_chunk *c)
+static bool unmap_memory(struct m0_be_allocator *a, void *unmap_addr,
+			 m0_bcount_t unmap_bytes)
 {
-	int rc;
-	m0_bcount_t chunk_size = c->bac_size + sizeof *c;
-	m0_bcount_t page_size = m0_pagesize_get();
+	int         rc;
+	int         file_descriptor = m0_stob_fd(a->ba_seg->bs_stob);
+	m0_bcount_t file_offset = unmap_addr - a->ba_seg->bs_addr;
 
-	if (chunk_size > page_size) {
-		/**
-		 * Skip the first page which contains the chunk header.
-		 */
-		void *temp = (((void *)c)) + page_size;
-		chunk_size -= page_size;
+	M0_PRE((((uint64_t)unmap_addr) & (m0_pagesize_get() - 1)) == 0 &&
+	       (unmap_bytes & (m0_pagesize_get() - 1)) == 0);
 
-		M0_LOG(M0_DEBUG, "c=%p temp=%p bac_size=%"PRIu64
-				 " chunk_size=%"PRIu64, c, temp,
-				 c->bac_size, chunk_size);
-		munmap(temp, chunk_size);
+	if (!m0_memory_unmap(unmap_addr, unmap_bytes))
+		return false;
 
-		rc = madvise(temp, chunk_size, MADV_NORMAL);
-		M0_ASSERT(rc == -1 && errno == ENOMEM); /** Assert BE segment unmapped*/
+	/** TBD - Next 2 lines are to be removed after debugging is done. */
+	rc = madvise(unmap_addr, unmap_bytes, MADV_NORMAL);
+	M0_ASSERT(rc == -1 && errno == ENOMEM);
 
-		mmap(temp, chunk_size, PROT_READ | PROT_WRITE,
-		MAP_FIXED | MAP_PRIVATE | MAP_NORESERVE,
-		m0_stob_fd(a->ba_seg->bs_stob),
-		(m0_bcount_t)(temp - a->ba_seg->bs_addr));
+	if (!m0_memory_map(unmap_addr, unmap_bytes, file_descriptor,
+			  file_offset))
+		return false;
 
-		rc = madvise(temp, chunk_size, MADV_NORMAL);
-		M0_ASSERT(rc == 0);
-		return true;
-	}
-	return false;
+	/** TBD - Next 2 lines are to be removed after debugging is done. */
+	rc = madvise(unmap_addr, unmap_bytes, MADV_NORMAL);
+	M0_ASSERT(rc == 0);
+	return true;
+
 }
 
 M0_INTERNAL void m0_be_free_aligned(struct m0_be_allocator *a,
@@ -1176,10 +1171,13 @@ M0_INTERNAL void m0_be_free_aligned(struct m0_be_allocator *a,
 {
 	enum m0_be_alloc_zone_type  ztype;
 	struct be_alloc_chunk      *c;
+	struct be_alloc_chunk      *orig_c;
 	struct be_alloc_chunk      *prev;
 	struct be_alloc_chunk      *next;
-	bool                        prev_chunk_were_merged;
-	bool                        next_chunk_were_merged;
+	bool                        merged_with_prev_chunk;
+	bool                        merged_with_next_chunk;
+	void                       *unmap_addr;
+	m0_bcount_t                 unmap_bytes;
 
 	M0_PRE(ptr != NULL);
 	M0_PRE(m0_reduce(z, M0_BAP_NR, 0,
@@ -1191,6 +1189,8 @@ M0_INTERNAL void m0_be_free_aligned(struct m0_be_allocator *a,
 	M0_PRE_EX(m0_be_allocator__invariant(a));
 
 	c = be_alloc_chunk_addr(ptr);
+	orig_c = c;
+	M0_PRE(ergo(unmap, c->bac_chunk_align));
 	M0_PRE(be_alloc_chunk_invariant(a, c));
 	M0_PRE(!c->bac_free);
 	ztype = c->bac_zone;
@@ -1198,7 +1198,14 @@ M0_INTERNAL void m0_be_free_aligned(struct m0_be_allocator *a,
 			"data=%p", a, c, c->bac_size, c->bac_zone, &c->bac_mem);
 	/* algorithm starts here */
 	be_alloc_chunk_mark_free(a, ztype, tx, c);
-	
+
+	if (unmap) {
+		/* Skip unmapping page containing the chunk header */
+		unmap_addr = ((void *)orig_c) + m0_pagesize_get();
+		unmap_bytes = orig_c->bac_size + sizeof(struct be_alloc_chunk) -
+			      m0_pagesize_get();
+	}
+
 	/**
 	 * Need to check bac_chunk_align = false
 	 * assumption is coming here from bnode_alloc/bnode_free [].
@@ -1209,18 +1216,30 @@ M0_INTERNAL void m0_be_free_aligned(struct m0_be_allocator *a,
 			c->bac_size, false, false);
 	prev = be_alloc_chunk_prev(a, ztype, c);
 	next = be_alloc_chunk_next(a, ztype, c);
-	prev_chunk_were_merged = be_alloc_chunk_trymerge(a, ztype, tx, prev, c);
-	if (prev_chunk_were_merged)
+	merged_with_prev_chunk = be_alloc_chunk_trymerge(a, ztype, tx, prev, c);
+	if (merged_with_prev_chunk)
 		c = prev;
-	next_chunk_were_merged = be_alloc_chunk_trymerge(a, ztype, tx, c, next);
+	merged_with_next_chunk = be_alloc_chunk_trymerge(a, ztype, tx, c, next);
 
 	if (unmap) {
 		M0_LOG(M0_DEBUG, ">>>c+prev=%s and c+next=%s and only_c=%s",
-				prev_chunk_were_merged ? "YES": "NO",
-				next_chunk_were_merged ? "YES": "NO",
-				(!prev_chunk_were_merged && !next_chunk_were_merged) ? "YES": "/"
+				merged_with_prev_chunk ? "YES": "NO",
+				merged_with_next_chunk ? "YES": "NO",
+				(!merged_with_prev_chunk && !merged_with_next_chunk) ? "YES": "/"
 				);
-		unmap_memory(a, c);
+
+		if (merged_with_prev_chunk) {
+			unmap_addr = orig_c;
+			unmap_bytes = orig_c->bac_size +
+					      sizeof(struct be_alloc_chunk);
+		}
+
+		if (merged_with_next_chunk && next->bac_chunk_align)
+			/* Unmap page containing next chunk's header. */
+			unmap_bytes += m0_pagesize_get();
+
+		if (unmap_bytes > 0)
+			unmap_memory(a, unmap_addr, unmap_bytes);
 	}
 
 	be_allocator_stats_capture(a, ztype, tx);
